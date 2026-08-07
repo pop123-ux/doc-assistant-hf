@@ -105,3 +105,8 @@ The last cell calls `demo.launch(share=True)`, which prints a temporary public U
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## 🔗 More
+
+- Author: [@pop123-ux](https://github.com/pop123-ux)
+- Medium write-ups: [medium.com/@Pop123](https://medium.com/@Pop123)
