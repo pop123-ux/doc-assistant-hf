@@ -12,7 +12,7 @@ The Gradio app exposes three tabs, each accepting pasted text *or* a file upload
 
 | Tab | Output |
 | --- | --- |
-| **Document Summarizer (Extractive)** | A fixed 3-bullet summary, sentence-split with NLTK |
+| **Document Summarizer (Extractive)** | A 3–6 bullet summary, sentence-split with NLTK |
 | **Document Summarizer (Abstractive)** | A continuous prose summary (50–256 new tokens, 4-beam search) |
 | **Document QA System** | A span copied verbatim from the document, or `"No answer found."` |
 
@@ -91,16 +91,33 @@ Rather than calling the `question-answering` pipeline, the notebook runs the mod
 
 These are real constraints of the current notebook, documented rather than hidden.
 
-* **The advertised 2,048-token summarizer limit is not safe.** Both summary functions compute `max_input_length = min(tokenizer1.model_max_length, 2048)`. For this checkpoint `tokenizer1.model_max_length` returns the "unset" sentinel (`1e30`), so the cap resolves to **2,048** — but BART-large-CNN only has **1,024 learned positional embeddings**. Inputs between roughly 1,025 and 2,048 tokens are therefore truncated to a length the model cannot encode and will fail at generation time. The genuinely safe ceiling is 1,024 tokens; the UI tab labels quoting 2,048 overstate it.
+* **The UI tab labels still quote the old 2,048-token limit.** The summarizer functions now clamp correctly to `min(tokenizer1.model_max_length, 1024)`, matching BART-large-CNN's 1,024 learned positional embeddings — but both tab titles still read *"LIMIT: 2048 tokens"*. Cosmetic only; the enforced cap is the correct one.
+* **Bullet counts above 3 degrade quality.** `process_summary_extractive` scales generation length by the requested bullet count (`min_new_tokens=14*bpn`, `max_new_tokens=35*bpn`). At `bpn=6` that forces at least 84 new tokens, which is far longer than the 1–2 sentence summaries the SAMSum adapter was trained to produce — so the model pads the gap with repetition or invented detail. The count itself is also not guaranteed: NLTK splits whatever BART generated, and any shortfall is filled with the literal placeholder *"Key detail omitted by BART…"*. See [Tuning the extractive tab](#tuning-the-extractive-tab).
+* **The lower bound still forbids 1–2 bullets.** `assert bpn > 2` means the control accepts 3–6 only, and an out-of-range value raises an `AssertionError` that surfaces as a Gradio error rather than a friendly message.
 * **The end-of-sequence token is masked out of the training loss.** `tokenizer1.pad_token` is set to `tokenizer1.eos_token`, which makes `pad_token_id == eos_token_id == 2` (the trainer confirms this: *"Updated tokens: {'pad_token_id': 2}"*). The tokenize function then rewrites every label token equal to `pad_token_id` to `-100` — which masks the real `</s>` terminating each target summary, not just padding. The model consequently gets no gradient signal for *when to stop*, and generation leans on `max_new_tokens` / `early_stopping` instead. The manual rewrite is also redundant, since `DataCollatorForSeq2Seq(label_pad_token_id=-100)` already masks padding.
-* **The "Extractive" tab is not extractive.** It runs the same abstractive BART generation as the other tab, then splits the *generated* text into sentences with NLTK and prefixes each with `- `. True extractive summarization selects sentences from the source document. The output is better described as bullet-formatted abstractive summary — and because the bullets come from generated text, they can still depart from the source.
-* **The bullet count is effectively locked to 3.** The guard pair `assert bpn > 2` and `assert bpn <= 3` admits only the value 3, so the "max 3" control has exactly one legal setting. The second assertion's message ("lower than 6") describes a different bound than the check enforces, and the `assert bpn is not None` check sits *after* comparisons that would already raise on `None`.
+* **The "Extractive" tab is not extractive.** It runs the same abstractive BART generation as the other tab, then splits the *generated* text into sentences with NLTK and prefixes each with `- `. True extractive summarization selects sentences from the source document. The output is better described as bullet-formatted abstractive summary — and because the bullets come from generated text, they can still depart from the source. This is the root cause of the bullet-count problems above.
 * **QA input is truncated to 1,024 tokens** even though Longformer supports 4,096 — raising `max_length` in `process_qa` would use the full window.
 * **No chunk-and-merge pass.** Documents longer than the input cap are silently truncated, so only the opening section is summarized or searched.
 * **SAMSum is conversational**, so the adapter pulls the summarizer toward chat and meeting transcripts. On formal reports, stock BART-large-CNN may well read better than the fine-tuned version.
 * **`.doc` is matched in the extension check but not supported** — `python-docx` reads only `.docx`. In practice the upload widget filters to `.pdf`, `.docx` and `.txt`, so the branch is unreachable.
-* **The install cell is fragile.** `!pip install -U transformers, peft` carries a stray comma (pip receives `transformers,` as the requirement string), and `!pip install -U bitsandbytes>=0.46.1` is unquoted, so the shell reads `>=0.46.1` as an output redirection and the version constraint never reaches pip. Quote the specifier — `"bitsandbytes>=0.46.1"` — and drop the comma.
 * **Notebook-only, and GPU-bound.** There is no `app.py` or `requirements.txt`, inference assumes a CUDA runtime, and `adapter_path` points at Google Drive — so re-running requires either that Drive mount or switching the path to the published Hub adapter.
+
+## Tuning the extractive tab
+
+Asking for more bullets tends to produce repetition, invented detail, or fewer bullets than requested. The cause is structural rather than a parameter that needs nudging: the tab generates **one** abstractive summary whose length is scaled by the bullet count, then slices it into sentences. Nothing ties the number of sentences BART produces to the number requested.
+
+Two levers matter most:
+
+* **`min_new_tokens=14*bpn` is the main driver of hallucination.** A minimum length is a hard ban on emitting `</s>` before the floor is reached, so at `bpn=6` the model is forbidden to stop for 84 tokens even when it has said everything the source supports. It fills the remainder by repeating or inventing. Prefer raising `length_penalty` (which biases beam *scoring* toward longer sequences) over raising `min_new_tokens` (which forbids stopping outright). The masked-`</s>` training issue above compounds this, because the adapter's stopping signal is already weak.
+* **SAMSum summaries are 1–2 sentences.** The adapter was fine-tuned toward short, conversational output, so demanding six sentences works against the fine-tune. Stock `facebook/bart-large-cnn` produces longer multi-sentence summaries and behaves better at high bullet counts.
+
+Three ways to get a reliable *N*, in increasing order of fidelity to the tab's name:
+
+1. **Chunk-and-summarize** — split the source into `bpn` roughly equal chunks and generate one short summary per chunk (`max_new_tokens≈40`, no `min_new_tokens`). Exactly *N* bullets, each grounded in a different part of the document, and it reuses the existing model.
+2. **Over-generate and select** — generate a single longer summary, sentence-split it, then keep the `bpn` best sentences (longest, or highest TF-IDF overlap with the source) instead of the first `bpn`. Removes the placeholder filler.
+3. **Genuine extraction** — score the *source* sentences and select the top `bpn` (TF-IDF centroid, TextRank via `sumy`, or embedding centrality with `sentence-transformers`). Guarantees the exact count, cannot hallucinate, needs no generation at all, and makes the tab's name accurate.
+
+Option 3 is the recommended fix, with option 1 as the smaller change. If the current approach is kept, drop `min_new_tokens`, keep `no_repeat_ngram_size=3`, and leave `repetition_penalty` near 1.1 — pushing it much past ~1.2 with beam search tends to cause degeneration rather than fix it.
 
 ## Running it
 
@@ -125,7 +142,7 @@ The final cell calls `demo.launch(share=True)`, which prints a temporary public 
 
 ## Roadmap
 
-* Clamp the summarizer input to BART's real 1,024-token limit and correct the UI labels.
+* Correct the UI tab labels to quote the enforced 1,024-token limit.
 * Stop masking `</s>` in the labels, then retrain and compare.
 * True extractive summarization (score and select source sentences) rather than bulleting generated text.
 * Chunk-and-merge summarization for long documents.
