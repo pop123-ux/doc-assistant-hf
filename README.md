@@ -1,13 +1,10 @@
 # doc-assistant-hf
 
-An AI-powered document intelligence tool built with Hugging Face Transformers and Gradio. Upload a PDF, DOCX or TXT file — or paste text directly — and get a bulleted summary, a prose summary, or an exact answer extracted verbatim from the document.
+A document intelligence tool built with Hugging Face Transformers and Gradio. Upload a PDF, DOCX or TXT file — or paste text directly — and get a bulleted summary, a prose summary, or an exact answer extracted verbatim from the document.
 
-Each notebook covers the whole pipeline: loading the dataset, fine-tuning the summarizer with QLoRA, loading the QA model, parsing documents and launching the UI.
+> **This is a learning and portfolio project, not a production service.** It was built to work through three things end to end on free-tier hardware: fine-tuning a seq2seq model with QLoRA, running extractive QA with custom span decoding, and — after the first approach failed — implementing a classical NLP ranking algorithm from scratch. The write-up below documents the reasoning and the dead ends as much as the result. Training was a single epoch with no ROUGE evaluation, and everything runs in one Colab notebook.
 
-| Notebook | Status |
-| --- | --- |
-| [`coded-test.ipynb`](coded-test.ipynb) | **Current.** Extractive tab rewritten as TF-IDF + PageRank (TextRank) |
-| [`coded.ipynb`](coded.ipynb) | Original — extractive tab still generates with BART and bullets the result |
+[`coded-test.ipynb`](coded-test.ipynb) covers the whole pipeline: loading the dataset, fine-tuning the summarizer with QLoRA, loading the QA model, parsing documents and launching the UI.
 
 <a href="https://colab.research.google.com/github/pop123-ux/doc-assistant-hf/blob/main/coded-test.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
@@ -81,31 +78,33 @@ LoraConfig(r=8, lora_alpha=32, lora_dropout=0.1, task_type=TaskType.SEQ_2_SEQ_LM
 
 Three `nan` gradient norms appear at steps 1, 7 and 8 — ordinary fp16 loss-scaler warmup, after which the scaler settles and every subsequent step reports a finite norm.
 
-Note the wide gap between the averaged `train_loss` (6.32) and the final `eval_loss` (1.57). Part of it is arithmetic — the average includes the very high early steps — but the per-step training loss still plateaus around 6, which is high. The label-masking issue described under [Known limitations](#known-limitations) is the most likely contributor. **No ROUGE evaluation was run**, so treat this as a working, demonstrative pipeline rather than a benchmarked model.
+Note the wide gap between the averaged `train_loss` (6.32) and the final `eval_loss` (1.57). Part of it is arithmetic — the average includes the very high early steps — but the per-step training loss still plateaus around 6, which is high. The label-masking issue described under [Limitations and scope](#limitations-and-scope) is the most likely contributor. **No ROUGE evaluation was run**, so treat this as a working, demonstrative pipeline rather than a benchmarked model.
 
 The adapter is persisted three ways: pushed to the Hub via `trainer.push_to_hub()`, saved to Google Drive, and reloaded with `PeftModel.from_pretrained` so inference can resume without retraining.
 
-## How QA answers are picked
+## The extractive tab: what didn't work, and why
 
-Rather than calling the `question-answering` pipeline, the notebook runs the model directly and decodes spans itself:
+The first implementation — `process_summary_extractive`, still present in the notebook as a record of the attempt — was not extractive at all. It generated an abstractive summary with the fine-tuned BART, then split the *generated* text into sentences with NLTK and prefixed each with a bullet:
 
-1. Take the top 20 start logits and top 20 end logits.
-2. Reject any pair where `end < start`, or where the span exceeds 30 tokens.
-3. Score each surviving pair as `start_logit + end_logit` and decode the highest.
-4. Return `"No answer found."` if nothing valid survives.
+```python
+summary_ids = model1.generate(
+    **inputs,
+    max_new_tokens=35 * bpn,
+    min_new_tokens=14 * bpn,   # <- the problem
+    ...
+)
+sentences = nltk.sent_tokenize(summary)
+```
 
-## Known limitations
+It behaved acceptably at three bullets and fell apart above that, in two distinct ways:
 
-These are real constraints of the current notebook, documented rather than hidden.
+**It repeated itself and invented detail.** `min_new_tokens` is a hard ban on emitting the end-of-sequence token before the floor is reached. At six bullets that floor is 84 tokens, so once the model had said everything the source supported, it was *forbidden to stop* — and filled the remainder by repeating phrases or inventing content. Scaling the minimum length with the requested bullet count meant every extra bullet made this worse. The masked-`</s>` bug in the fine-tuning (see limitations) compounded it, since the adapter's stopping signal was already weak.
 
-* **A stopword-only document crashes the extractive tab.** `TfidfVectorizer(stop_words='english')` raises `ValueError: empty vocabulary` when every token is filtered out. It only fires when such a document also has more sentences than the requested bullet count — otherwise the short-document early return catches it first — so no real document will hit it, but it currently surfaces as a raw Gradio traceback.
-* **`process_summary_extractive` is dead code in `coded-test.ipynb`.** The old BART-generate-then-bullet function is still defined but nothing calls it; the extractive tab is wired to `textrank_summarization`.
-* **The end-of-sequence token is masked out of the training loss.** `tokenizer1.pad_token` is set to `tokenizer1.eos_token`, which makes `pad_token_id == eos_token_id == 2` (the trainer confirms this: *"Updated tokens: {'pad_token_id': 2}"*). The tokenize function then rewrites every label token equal to `pad_token_id` to `-100` — which masks the real `</s>` terminating each target summary, not just padding. The model consequently gets no gradient signal for *when to stop*, and generation leans on `max_new_tokens` / `early_stopping` instead. The manual rewrite is also redundant, since `DataCollatorForSeq2Seq(label_pad_token_id=-100)` already masks padding.
-* **QA input is truncated to 1,024 tokens** even though Longformer supports 4,096 — raising `max_length` in `process_qa` would use the full window.
-* **No chunk-and-merge pass on the abstractive tab.** Documents past 1,024 tokens are silently truncated, so only the opening section is summarized. The extractive tab is unaffected — it never calls BART.
-* **SAMSum is conversational**, so the adapter pulls the summarizer toward chat and meeting transcripts. On formal reports, stock BART-large-CNN may well read better than the fine-tuned version.
-* **`.doc` is matched in the extension check but not supported** — `python-docx` reads only `.docx`. In practice the upload widget filters to `.pdf`, `.docx` and `.txt`, so the branch is unreachable.
-* **Notebook-only, and GPU-bound.** There is no `app.py` or `requirements.txt`, inference assumes a CUDA runtime, and `adapter_path` points at Google Drive — so re-running requires either that Drive mount or switching the path to the published Hub adapter.
+**It couldn't honour the requested count.** Nothing connected "sentences BART generated" to "sentences requested". NLTK split whatever came out, and any shortfall was padded with a literal placeholder string — `"- Key detail omitted by BART (expand input or adjust parameters)."` — which is a bug wearing a UI message as a disguise.
+
+The deeper problem was conceptual: **the tab was named for a technique it wasn't using.** Extractive summarization selects sentences from the source; this generated new text and formatted it to look selected. That framing made the bullet count feel like a parameter to tune, when no generation parameter could have fixed it.
+
+Replacing it with TextRank resolved both symptoms at once and made the name accurate. The lesson worth keeping: *when output quality degrades as you push a knob, check whether the knob is the right abstraction before tuning it.*
 
 ## How the extractive summarizer works
 
@@ -119,6 +118,34 @@ These are real constraints of the current notebook, documented rather than hidde
 6. **Emit.** Take the top *N*, re-sort by original position so the summary reads in document order, and format as bullets.
 
 Because the output is copied verbatim from the source, this tab cannot hallucinate, always returns exactly the requested number of bullets, and has no input-length ceiling.
+
+## How QA answers are picked
+
+Rather than calling the `question-answering` pipeline, the notebook runs the model directly and decodes spans itself:
+
+1. Take the top 20 start logits and top 20 end logits.
+2. Reject any pair where `end < start`, or where the span exceeds 30 tokens.
+3. Score each surviving pair as `start_logit + end_logit` and decode the highest.
+4. Return `"No answer found."` if nothing valid survives.
+
+## Limitations and scope
+
+This is a learning project, so some of these are bugs worth fixing and others are deliberate scope choices. Both are listed, labelled honestly.
+
+**Known bugs**
+
+* **The end-of-sequence token is masked out of the training loss.** `tokenizer1.pad_token` is set to `tokenizer1.eos_token`, which makes `pad_token_id == eos_token_id == 2` (the trainer confirms this: *"Updated tokens: {'pad_token_id': 2}"*). The tokenize function then rewrites every label token equal to `pad_token_id` to `-100` — which masks the real `</s>` terminating each target summary, not just padding. The model consequently gets no gradient signal for *when to stop*, and generation leans on `max_new_tokens` / `early_stopping` instead. The manual rewrite is also redundant, since `DataCollatorForSeq2Seq(label_pad_token_id=-100)` already masks padding.
+* **QA input is truncated to 1,024 tokens** even though Longformer supports 4,096 — raising `max_length` in `process_qa` would use the full window.
+* **`.doc` is matched in the extension check but not supported** — `python-docx` reads only `.docx`. The upload widget filters to `.pdf`, `.docx` and `.txt`, so the branch is unreachable.
+* **The two summarizer paths use different bullet characters** — the short-document early return emits `-`, the ranked path emits `•`.
+
+**Deliberate scope choices**
+
+* **One epoch, no ROUGE.** The fine-tune demonstrates the QLoRA workflow rather than chasing a benchmark. `eval_loss` 1.57 is reported instead of a task metric, so the summarizer should be read as a working pipeline, not a tuned model.
+* **`process_summary_extractive` is kept but unused.** It is the superseded first attempt, left in place as documentation of the iteration described above. Nothing calls it — the tab is wired to `textrank_summarization`.
+* **No chunk-and-merge on the abstractive tab.** Documents past 1,024 tokens are truncated, so only the opening section is summarized. The extractive tab is unaffected since it never calls BART.
+* **SAMSum is conversational**, so the adapter pulls the summarizer toward chat and meeting transcripts. On formal reports, stock BART-large-CNN may well read better than the fine-tuned version — the dataset was chosen for its size and cleanliness on free-tier hardware, not for domain fit.
+* **Notebook-only, and GPU-bound.** There is no `app.py` or `requirements.txt`, inference assumes a CUDA runtime, and `adapter_path` points at Google Drive — so re-running requires either that Drive mount or switching the path to the published Hub adapter.
 
 ## Running it
 
@@ -145,8 +172,6 @@ The final cell calls `demo.launch(share=True)`, which prints a temporary public 
 
 ## Roadmap
 
-* Fall back to an unfiltered `TfidfVectorizer` when stop-word removal empties the vocabulary.
-* Merge `coded-test.ipynb` back into `coded.ipynb` and drop the unused `process_summary_extractive`.
 * Stop masking `</s>` in the labels, then retrain and compare.
 * Chunk-and-merge summarization for the abstractive tab.
 * Raise the QA window from 1,024 to Longformer's full 4,096.
