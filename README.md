@@ -4,9 +4,9 @@ A document intelligence tool built with Hugging Face Transformers and Gradio. Up
 
 > **This is a learning and portfolio project, not a production service.** It was built to work through three things end to end on free-tier hardware: fine-tuning a seq2seq model with QLoRA, running extractive QA with custom span decoding, and — after the first approach failed — implementing a classical NLP ranking algorithm from scratch. The write-up below documents the reasoning and the dead ends as much as the result. Training was a single epoch with no ROUGE evaluation, and everything runs in one Colab notebook.
 
-[`coded-test.ipynb`](coded-test.ipynb) covers the whole pipeline: loading the dataset, fine-tuning the summarizer with QLoRA, loading the QA model, parsing documents and launching the UI.
+[`doc_assistant.ipynb`](doc_assistant.ipynb) covers the whole pipeline: loading the dataset, fine-tuning the summarizer with QLoRA, loading the QA model, parsing documents and launching the UI.
 
-<a href="https://colab.research.google.com/github/pop123-ux/doc-assistant-hf/blob/main/coded-test.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+<a href="https://colab.research.google.com/github/pop123-ux/doc-assistant-hf/blob/main/doc_assistant.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 ## What it does
 
@@ -137,7 +137,6 @@ This is a learning project, so some of these are bugs worth fixing and others ar
 * **The end-of-sequence token is masked out of the training loss.** `tokenizer1.pad_token` is set to `tokenizer1.eos_token`, which makes `pad_token_id == eos_token_id == 2` (the trainer confirms this: *"Updated tokens: {'pad_token_id': 2}"*). The tokenize function then rewrites every label token equal to `pad_token_id` to `-100` — which masks the real `</s>` terminating each target summary, not just padding. The model consequently gets no gradient signal for *when to stop*, and generation leans on `max_new_tokens` / `early_stopping` instead. The manual rewrite is also redundant, since `DataCollatorForSeq2Seq(label_pad_token_id=-100)` already masks padding.
 * **QA input is truncated to 1,024 tokens** even though Longformer supports 4,096 — raising `max_length` in `process_qa` would use the full window.
 * **`.doc` is matched in the extension check but not supported** — `python-docx` reads only `.docx`. The upload widget filters to `.pdf`, `.docx` and `.txt`, so the branch is unreachable.
-* **The two summarizer paths use different bullet characters** — the short-document early return emits `-`, the ranked path emits `•`.
 
 **Deliberate scope choices**
 
